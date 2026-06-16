@@ -43,6 +43,10 @@ from transformers.models.qwen2_5_omni.processing_qwen2_5_omni import (
 )
 from transformers.models.whisper import WhisperFeatureExtractor
 
+from vllm.compilation.decorators import (
+    should_torch_compile_mm_encoder,
+    support_torch_compile,
+)
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -325,6 +329,18 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         return output
 
 
+@support_torch_compile(
+    # hidden_states is 2-D [total_tokens, d_model] (unbatched/packed) -> only dim 0
+    # (token count) is dynamic; cu_seqlens dim 0 (num sequences) is dynamic.
+    # max_seqlen is omitted on purpose: it is a scalar tensor / None and must stay
+    # static (the attn backend is fixed at construction, so its kind never flips).
+    dynamic_arg_dims={
+        "hidden_states": 0,
+        "cu_seqlens": 0,
+    },
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class Qwen2_5OmniAudioEncoderLayer(nn.Module):
     """Transformer encoder layer for the Qwen2.5-Omni audio tower."""
 
