@@ -1443,7 +1443,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
         # replays, so the cu_seqlens buffer has a fixed shape regardless of budget.
         max_budget = min(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
-            self.model_config.max_model_len,
+            self.vllm_config.model_config.max_model_len,
         )
         max_pre = 2 * max_budget + 64
         win = max(self._audio_cg_post_cnn_window() // 2, 1)
@@ -1469,7 +1469,9 @@ class Qwen2_5OmniConditionalGenerationMixin:
             # input_buffer key: use the tiny per-clip lengths (the captured forward
             # ignores it; this avoids a large unused input_features buffer).
             input_key_by_modality={"audio": "audio_feature_lengths"},
-            buffer_keys=["hidden_states", "cu_seqlens", "max_seqlen"],
+            # max_seqlen is NOT copied per replay: it is baked at capture as a CPU
+            # upper bound (flash reads it via host-side .item(), no D2H sync).
+            buffer_keys=["hidden_states", "cu_seqlens"],
             out_hidden_size=self.audio_tower.config.output_dim,
             max_frames_per_video=1,
         )
@@ -1484,7 +1486,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
         min_budget = 16
         max_budget = min(
             vllm_config.scheduler_config.max_num_batched_tokens,
-            self.model_config.max_model_len,
+            self.vllm_config.model_config.max_model_len,
         )
         return (min_budget, max(max_budget, min_budget))
 
@@ -1501,7 +1503,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
         ]
 
     def select_encoder_cudagraph_items(self, mm_kwargs, indices):
-        input_features = mm_kwargs["input_features"]
+        input_features = mm_kwargs["input_audio_features"]
         feature_lens = mm_kwargs["audio_feature_lengths"]
         lens = feature_lens.tolist()
         offsets = [0]
@@ -1509,7 +1511,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
             offsets.append(offsets[-1] + int(length))
         if len(indices) == 0:
             return {
-                "input_features": input_features[..., :0],
+                "input_audio_features": input_features[..., :0],
                 "audio_feature_lengths": feature_lens[:0],
             }
         sel = torch.cat(
@@ -1517,7 +1519,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
             dim=-1,
         )
         return {
-            "input_features": sel,
+            "input_audio_features": sel,
             "audio_feature_lengths": feature_lens[list(indices)],
         }
 
@@ -1537,7 +1539,10 @@ class Qwen2_5OmniConditionalGenerationMixin:
         cu = self._audio_cg_pad_cu_seqlens(
             torch.tensor(bounds, device=device, dtype=torch.int32)
         )
-        max_seqlen = torch.tensor(win, device=device, dtype=torch.int32)
+        # CPU tensor on purpose: the flash wrapper does max_seqlen.item(), which on
+        # a CPU tensor is a host read (no D2H sync) and is allowed during CUDA graph
+        # capture. The value is baked into the graph as a safe per-window upper bound.
+        max_seqlen = torch.tensor(win, dtype=torch.int32)
         return EncoderCudaGraphCaptureInputs(
             mm_kwargs={
                 "audio_feature_lengths": torch.zeros(
@@ -1558,23 +1563,17 @@ class Qwen2_5OmniConditionalGenerationMixin:
             EncoderCudaGraphReplayBuffers,
         )
 
-        input_features = mm_kwargs["input_features"].to(self.audio_tower.dtype)
+        input_features = mm_kwargs["input_audio_features"].to(self.audio_tower.dtype)
         feature_lens = mm_kwargs["audio_feature_lengths"]
-        hidden_states, cu_seqlens, max_seqlen = self.audio_tower._encode_prologue(
+        hidden_states, cu_seqlens, _ = self.audio_tower._encode_prologue(
             input_features, feature_lens
         )
         cu_seqlens = self._audio_cg_pad_cu_seqlens(cu_seqlens)
-        if max_seqlen is None:
-            max_seqlen = torch.tensor(
-                self._audio_cg_post_cnn_window(),
-                device=cu_seqlens.device,
-                dtype=torch.int32,
-            )
+        # max_seqlen is omitted: it is baked at capture (CPU upper bound), not copied.
         return EncoderCudaGraphReplayBuffers(
             buffers={
                 "hidden_states": hidden_states,
                 "cu_seqlens": cu_seqlens,
-                "max_seqlen": max_seqlen,
             }
         )
 
@@ -1587,7 +1586,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
             )
 
     def encoder_eager_forward(self, mm_kwargs):
-        input_features = mm_kwargs["input_features"].to(self.audio_tower.dtype)
+        input_features = mm_kwargs["input_audio_features"].to(self.audio_tower.dtype)
         feature_lens = mm_kwargs["audio_feature_lengths"]
         feat_lengths, _ = self.audio_tower._get_feat_extract_output_lengths(feature_lens)
         with set_forward_context(None, self.vllm_config):
@@ -1665,8 +1664,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     SupportsPP,
     SupportsLoRA,
     SupportsMRoPE,
-    SupportsEncoderCudaGraph,
+    # NOTE: SupportsEncoderCudaGraph must come AFTER the mixin that defines the
+    # concrete protocol methods, else the Protocol's abstract stubs (which return
+    # None) shadow them in the MRO. The `supports_encoder_cudagraph` ClassVar is
+    # inherited regardless of order.
     Qwen2_5OmniConditionalGenerationMixin,
+    SupportsEncoderCudaGraph,
 ):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
