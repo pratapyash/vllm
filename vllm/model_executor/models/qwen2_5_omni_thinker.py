@@ -475,6 +475,25 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
         feature_lens: torch.Tensor,
         aftercnn_lens: torch.Tensor,
     ) -> torch.Tensor:
+        # Split into an eager prologue (variable-shape conv/chunk/pack, with
+        # host-syncs) -> the encoder layer stack (fixed-shape; the CUDA-graph
+        # capturable region) -> an eager per-clip pool/proj epilogue. Behavior is
+        # identical to the original single-method forward; the split exposes the
+        # layer stack as the seam used by the encoder-cudagraph path (Phase B).
+        hidden_states, cu_seqlens, max_seqlen = self._encode_prologue(
+            input_features, feature_lens
+        )
+        hidden_states = self._run_encoder_layers(hidden_states, cu_seqlens, max_seqlen)
+        return self._encode_epilogue(hidden_states, aftercnn_lens)
+
+    def _encode_prologue(
+        self,
+        input_features: torch.Tensor,
+        feature_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Eager: chunk + conv stem + pack -> (hidden_states, cu_seqlens,
+        max_seqlen). Contains data-dependent shapes and host-syncs, so it is NOT
+        part of the CUDA-graph capturable region."""
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
         num_chunks = int(chunk_num.sum().item())
         chunk_lengths = torch.tensor(
@@ -520,7 +539,17 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
             )
         ).to(torch.int32)
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        return hidden_states, cu_seqlens, max_seqlen
 
+    def _run_encoder_layers(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """The fixed-shape transformer layer stack -- the CUDA-graph capturable
+        region. Inputs are the packed hidden_states plus precomputed varlen
+        metadata; no data-dependent shapes or host-syncs here."""
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
@@ -528,7 +557,15 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
                 max_seqlen,
             )
             hidden_states = layer_outputs[0]
+        return hidden_states
 
+    def _encode_epilogue(
+        self,
+        hidden_states: torch.Tensor,
+        aftercnn_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Eager: per-clip avg-pool + ln + proj. Splits by aftercnn_lens
+        (host-sync), so it stays outside the CUDA-graph region."""
         hidden_states_list = hidden_states.split(aftercnn_lens.tolist(), dim=0)
         token_audio_list = []
         for each_audio_states in hidden_states_list:
