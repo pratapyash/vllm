@@ -105,6 +105,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -1422,6 +1423,199 @@ class Qwen2_5OmniConditionalGenerationMixin:
             )
         return audio_outputs.split(audio_output_lengths.tolist())
 
+    # ---- SupportsEncoderCudaGraph (audio encoder; opt-in via cudagraph_mm_encoder) ----
+    # When cudagraph_mm_encoder is False (default), the EncoderCudaGraphManager is
+    # never built and NONE of these methods run -- the audio path is byte-identical
+    # to eager. When True, the manager captures ONLY the fixed-shape transformer
+    # layer stack (Qwen2_5OmniAudioEncoder._run_encoder_layers): the host-sync
+    # conv/chunk/pack prologue runs eagerly in prepare_encoder_cudagraph_replay_buffers
+    # and the per-clip avg-pool/proj epilogue runs eagerly in postprocess_encoder_output.
+    # cu_seqlens is padded to a stable window count (repeat last value); flash-varlen
+    # only reads [0:cu_seqlens[-1]], so the zero-padded budget slack is ignored.
+
+    def _audio_cg_post_cnn_window(self) -> int:
+        # pre-CNN chunk = n_window*2 frames; conv2 stride-2 -> post-CNN window tokens.
+        n = self.audio_tower.n_window * 2
+        return (n - 1) // 2 + 1
+
+    def _audio_cg_max_windows(self) -> int:
+        # Global stable upper bound on the number of attention windows across all
+        # replays, so the cu_seqlens buffer has a fixed shape regardless of budget.
+        max_budget = min(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            self.model_config.max_model_len,
+        )
+        max_pre = 2 * max_budget + 64
+        win = max(self._audio_cg_post_cnn_window() // 2, 1)
+        return max_pre // win + 64
+
+    def _audio_cg_pad_cu_seqlens(self, cu_seqlens):
+        target = self._audio_cg_max_windows() + 1
+        n = cu_seqlens.shape[0]
+        if n > target:
+            raise RuntimeError(
+                f"audio encoder cudagraph: {n - 1} windows exceed the stable max "
+                f"{target - 1}; raise _audio_cg_max_windows."
+            )
+        if n < target:
+            cu_seqlens = torch.cat([cu_seqlens, cu_seqlens[-1:].repeat(target - n)])
+        return cu_seqlens
+
+    def get_encoder_cudagraph_config(self):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
+
+        return EncoderCudaGraphConfig(
+            modalities=["audio"],
+            # input_buffer key: use the tiny per-clip lengths (the captured forward
+            # ignores it; this avoids a large unused input_features buffer).
+            input_key_by_modality={"audio": "audio_feature_lengths"},
+            buffer_keys=["hidden_states", "cu_seqlens", "max_seqlen"],
+            out_hidden_size=self.audio_tower.config.output_dim,
+            max_frames_per_video=1,
+        )
+
+    def get_input_modality(self, mm_kwargs) -> str:
+        return "audio"
+
+    def get_max_frames_per_video(self) -> int:
+        return 1
+
+    def get_encoder_cudagraph_budget_range(self, vllm_config):
+        min_budget = 16
+        max_budget = min(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            self.model_config.max_model_len,
+        )
+        return (min_budget, max(max_budget, min_budget))
+
+    def get_encoder_cudagraph_item_specs(self, mm_kwargs):
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
+
+        feature_lens = mm_kwargs["audio_feature_lengths"]
+        _, output_lengths = self.audio_tower._get_feat_extract_output_lengths(
+            feature_lens
+        )
+        return [
+            EncoderItemSpec(input_size=int(f), output_tokens=int(o))
+            for f, o in zip(feature_lens.tolist(), output_lengths.tolist())
+        ]
+
+    def select_encoder_cudagraph_items(self, mm_kwargs, indices):
+        input_features = mm_kwargs["input_features"]
+        feature_lens = mm_kwargs["audio_feature_lengths"]
+        lens = feature_lens.tolist()
+        offsets = [0]
+        for length in lens:
+            offsets.append(offsets[-1] + int(length))
+        if len(indices) == 0:
+            return {
+                "input_features": input_features[..., :0],
+                "audio_feature_lengths": feature_lens[:0],
+            }
+        sel = torch.cat(
+            [input_features[..., offsets[i] : offsets[i + 1]] for i in indices],
+            dim=-1,
+        )
+        return {
+            "input_features": sel,
+            "audio_feature_lengths": feature_lens[list(indices)],
+        }
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self, token_budget, max_batch_size, max_frames_per_batch, device, dtype
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphCaptureInputs,
+        )
+
+        d = self.audio_tower.config.d_model
+        # Pre-pool (aftercnn) tokens the layer stack runs on ~= 2x the post-pool budget.
+        budget_pre = 2 * token_budget + max_batch_size
+        win = self._audio_cg_post_cnn_window()
+        hidden_states = torch.randn(budget_pre, d, device=device, dtype=dtype)
+        bounds = list(range(0, budget_pre, win)) + [budget_pre]
+        cu = self._audio_cg_pad_cu_seqlens(
+            torch.tensor(bounds, device=device, dtype=torch.int32)
+        )
+        max_seqlen = torch.tensor(win, device=device, dtype=torch.int32)
+        return EncoderCudaGraphCaptureInputs(
+            mm_kwargs={
+                "audio_feature_lengths": torch.zeros(
+                    max_batch_size, device=device, dtype=torch.long
+                )
+            },
+            buffers={
+                "hidden_states": hidden_states,
+                "cu_seqlens": cu,
+                "max_seqlen": max_seqlen,
+            },
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self, mm_kwargs, max_batch_size, max_frames_per_batch
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphReplayBuffers,
+        )
+
+        input_features = mm_kwargs["input_features"].to(self.audio_tower.dtype)
+        feature_lens = mm_kwargs["audio_feature_lengths"]
+        hidden_states, cu_seqlens, max_seqlen = self.audio_tower._encode_prologue(
+            input_features, feature_lens
+        )
+        cu_seqlens = self._audio_cg_pad_cu_seqlens(cu_seqlens)
+        if max_seqlen is None:
+            max_seqlen = torch.tensor(
+                self._audio_cg_post_cnn_window(),
+                device=cu_seqlens.device,
+                dtype=torch.int32,
+            )
+        return EncoderCudaGraphReplayBuffers(
+            buffers={
+                "hidden_states": hidden_states,
+                "cu_seqlens": cu_seqlens,
+                "max_seqlen": max_seqlen,
+            }
+        )
+
+    def encoder_cudagraph_forward(self, mm_kwargs, buffers):
+        with set_forward_context(None, self.vllm_config):
+            return self.audio_tower._run_encoder_layers(
+                buffers["hidden_states"],
+                buffers["cu_seqlens"],
+                buffers["max_seqlen"],
+            )
+
+    def encoder_eager_forward(self, mm_kwargs):
+        input_features = mm_kwargs["input_features"].to(self.audio_tower.dtype)
+        feature_lens = mm_kwargs["audio_feature_lengths"]
+        feat_lengths, _ = self.audio_tower._get_feat_extract_output_lengths(feature_lens)
+        with set_forward_context(None, self.vllm_config):
+            return self.audio_tower(
+                input_features,
+                feature_lens=feature_lens,
+                aftercnn_lens=feat_lengths,
+            )
+
+    def postprocess_encoder_output(
+        self,
+        output,
+        indices,
+        per_item_out_tokens,
+        dest,
+        clone=False,
+        batch_mm_kwargs=None,
+    ):
+        from .utils import scatter_output_slices
+
+        feature_lens = batch_mm_kwargs["audio_feature_lengths"]
+        feat_lengths, _ = self.audio_tower._get_feat_extract_output_lengths(feature_lens)
+        total_pre = int(feat_lengths.sum().item())
+        # The captured layer stack ran over a zero-padded budget buffer; the valid
+        # pre-pool tokens are [0:total_pre]. Run the eager per-clip pool/proj on them.
+        pooled = self.audio_tower._encode_epilogue(output[:total_pre], feat_lengths)
+        scatter_output_slices(pooled, indices, per_item_out_tokens, dest)
+
     def _process_image_input(
         self, image_input: Qwen2_5_VLImageInputs
     ) -> tuple[torch.Tensor, ...]:
@@ -1471,6 +1665,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
     SupportsPP,
     SupportsLoRA,
     SupportsMRoPE,
+    SupportsEncoderCudaGraph,
     Qwen2_5OmniConditionalGenerationMixin,
 ):
     hf_to_vllm_mapper = WeightsMapper(
