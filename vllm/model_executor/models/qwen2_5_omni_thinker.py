@@ -1411,11 +1411,15 @@ class Qwen2_5OmniConditionalGenerationMixin:
             self.audio_tower._get_feat_extract_output_lengths(audio_feature_lengths)
         )
 
-        audio_outputs = self.audio_tower(
-            input_features.to(self.audio_tower.dtype),
-            feature_lens=audio_feature_lengths,
-            aftercnn_lens=audio_feat_lengths,
-        )
+        # Wrap in set_forward_context for parity with the image/video paths so
+        # the encoder attention backend dispatch sees an active forward context
+        # (needed once the audio encoder runs under the cudagraph path).
+        with set_forward_context(None, self.vllm_config):
+            audio_outputs = self.audio_tower(
+                input_features.to(self.audio_tower.dtype),
+                feature_lens=audio_feature_lengths,
+                aftercnn_lens=audio_feat_lengths,
+            )
         return audio_outputs.split(audio_output_lengths.tolist())
 
     def _process_image_input(
