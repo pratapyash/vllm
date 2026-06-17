@@ -224,10 +224,11 @@ class EncoderCudaGraphManager:
             output = self.model.encoder_cudagraph_forward(mm_kwargs, buffers)
             output_buffer.copy_(output)
 
-        # Since the image and video modalities share the same per-patch shape,
-        # so we can use the image dummy inputs to capture CUDA graph for both
-        # image and video.
-        input_key = self.config.input_key_by_modality["image"]
+        # Capture uses the first declared modality's dummy inputs. For
+        # image+video models the per-patch shape is shared, so the image dummy
+        # captures both; modalities[0] == "image" there keeps that behavior.
+        # Audio-only models declare modalities=["audio"] and capture from it.
+        input_key = self.config.input_key_by_modality[self.config.modalities[0]]
         self.budget_graphs[token_budget] = BudgetGraphMetadata(
             token_budget=token_budget,
             max_batch_size=self.max_batch_size,
