@@ -445,6 +445,16 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
             head_size=config.d_model // config.encoder_attention_heads,
             dtype=torch.get_default_dtype(),
         )
+        if self.attn_backend == AttentionBackendEnum.FLASHINFER:
+            # The audio encoder does not compute the doubled cu_seqlens /
+            # sequence_lengths that the FlashInfer encoder kernel requires (unlike
+            # the Qwen2.5-VL path). Fail fast at load with a clear message instead
+            # of asserting deep in the attention wrapper at the first request.
+            raise RuntimeError(
+                "The Qwen2.5-Omni audio encoder does not support the FLASHINFER "
+                "attention backend; use FLASH_ATTN or TORCH_SDPA (e.g. set "
+                "mm_encoder_attn_backend accordingly)."
+            )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1438,19 +1448,22 @@ class Qwen2_5OmniConditionalGenerationMixin:
         n = self.audio_tower.n_window * 2
         return (n - 1) // 2 + 1
 
-    def _audio_cg_max_windows(self) -> int:
+    def _audio_cg_max_windows(self, max_batch_size: int) -> int:
         # Global stable upper bound on the number of attention windows across all
         # replays, so the cu_seqlens buffer has a fixed shape regardless of budget.
+        # Slack-free, mirroring qwen2_5_vl.get_encoder_cudagraph_max_window_seqs:
+        # ceil(pre-pool tokens / window) plus one extra partial window per packed
+        # clip (max_batch_size). budget_pre matches the capture grid below.
         max_budget = min(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
             self.vllm_config.model_config.max_model_len,
         )
-        max_pre = 2 * max_budget + 64
-        win = max(self._audio_cg_post_cnn_window() // 2, 1)
-        return max_pre // win + 64
+        budget_pre = 2 * max_budget + max_batch_size
+        win = self._audio_cg_post_cnn_window()
+        return min(budget_pre, (budget_pre + win - 1) // win + max_batch_size)
 
-    def _audio_cg_pad_cu_seqlens(self, cu_seqlens):
-        target = self._audio_cg_max_windows() + 1
+    def _audio_cg_pad_cu_seqlens(self, cu_seqlens, max_batch_size):
+        target = self._audio_cg_max_windows(max_batch_size) + 1
         n = cu_seqlens.shape[0]
         if n > target:
             raise RuntimeError(
@@ -1544,7 +1557,8 @@ class Qwen2_5OmniConditionalGenerationMixin:
         hidden_states = torch.randn(budget_pre, d, device=device, dtype=dtype)
         bounds = list(range(0, budget_pre, win)) + [budget_pre]
         cu = self._audio_cg_pad_cu_seqlens(
-            torch.tensor(bounds, device=device, dtype=torch.int32)
+            torch.tensor(bounds, device=device, dtype=torch.int32),
+            max_batch_size,
         )
         # CPU tensor on purpose: the flash wrapper does max_seqlen.item(), which on
         # a CPU tensor is a host read (no D2H sync) and is allowed during CUDA graph
@@ -1617,7 +1631,11 @@ class Qwen2_5OmniConditionalGenerationMixin:
         # The captured layer stack ran over a zero-padded budget buffer; the valid
         # pre-pool tokens are [0:total_pre]. Run the eager per-clip pool/proj on them.
         pooled = self.audio_tower._encode_epilogue(output[:total_pre], feat_lengths)
-        scatter_output_slices(pooled, indices, per_item_out_tokens, dest)
+        # Forward `clone` to honor the manager's contract: it passes clone=True so
+        # the scattered slices do not alias a buffer it reuses. Safe today because
+        # `pooled` is a fresh torch.cat allocation, but a future epilogue returning a
+        # view into `output` would otherwise reintroduce aliasing.
+        scatter_output_slices(pooled, indices, per_item_out_tokens, dest, clone)
 
     def _process_image_input(
         self, image_input: Qwen2_5_VLImageInputs
@@ -1667,6 +1685,14 @@ def _pad_audio_cu_seqlens(dst: torch.Tensor, src: torch.Tensor) -> None:
     EncoderCudaGraphConfig.padding_logics for the "cu_seqlens" key.
     """
     n = src.shape[0]
+    if n > dst.shape[0]:
+        # Symmetric with the capture-time guard in _audio_cg_pad_cu_seqlens: surface
+        # a clear message instead of an opaque copy_ size-mismatch if a batch ever
+        # produces more attention windows than the captured buffer holds.
+        raise RuntimeError(
+            f"audio encoder cudagraph: {n - 1} replay windows exceed the captured "
+            f"buffer of {dst.shape[0] - 1}; raise _audio_cg_max_windows."
+        )
     dst.zero_()
     dst[:n].copy_(src)
     if n < dst.shape[0]:
