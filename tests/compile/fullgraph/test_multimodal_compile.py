@@ -77,14 +77,24 @@ def test_qwen2_5_vl_no_vit_compilation(vllm_runner, monkeypatch):
 @pytest.mark.forked
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 def test_qwen2_5_omni_audio_compilation(vllm_runner, monkeypatch):
-    """Test that the Qwen2.5-Omni audio encoder layers are compiled.
+    """Test that the Qwen2.5-Omni audio encoder layers are marked for compilation.
 
     The audio tower has 32 Qwen2_5OmniAudioEncoderLayer blocks, each decorated
     with @support_torch_compile(enable_if=should_torch_compile_mm_encoder).
-    With compile_mm_encoder=True, num_models_seen rises from 1 (the LLM backbone
-    only) to 67 -- the LLM plus the audio-encoder submodule compilations counted
-    across model init and the multimodal-encoder profiling pass. As with
-    Qwen2.5-VL (issue #27590), each layer is compiled separately today.
+
+    With compile_mm_encoder=True, num_models_seen rises from 1 (LLM backbone only)
+    to 67. This count is the LLM (1) plus BOTH multimodal encoders, since
+    Qwen2.5-Omni reuses the already-compile-decorated Qwen2_5_VisionTransformer:
+    34 vision-tower submodules (same 34 the Qwen2.5-VL test counts) + the 32 audio
+    encoder layers added here. The audio contribution is the +32 over stock
+    Qwen2.5-Omni's 35. As with Qwen2.5-VL (issue #27590) each layer is counted
+    separately today.
+
+    NOTE: num_models_seen only proves the layers are MARKED for compile (the
+    vision tower is marked here but never executes under image=0, so it produces
+    no graphs). That the audio encoder is actually compiled -- not a silent no-op
+    -- is shown by the end-to-end script in validation/phase_a (num_graphs_seen
+    1->33 and a fresh Inductor compile over the is_encoder (1, 2147483647) range).
     """
     # Disable multiprocessing so that the counter is in the same process
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
