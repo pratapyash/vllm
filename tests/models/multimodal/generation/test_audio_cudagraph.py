@@ -71,6 +71,13 @@ def get_compilation_config(config: AudioCudagraphTestConfig):
 # ---------------------------------------------------------------------------
 
 
+def _encoder_cudagraph_graph_hits(worker):
+    """Run on each worker via collective_rpc: number of encoder items served by a
+    captured CUDA graph (vs eager fallback). None if no manager was built."""
+    mgr = getattr(worker.model_runner, "encoder_cudagraph_manager", None)
+    return None if mgr is None else mgr.graph_hits
+
+
 @pytest.mark.parametrize("model_id", params_with_marks(MODEL_CONFIGS))
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 def test_audio_cudagraph(model_id, vllm_runner, audio_assets):
@@ -103,3 +110,12 @@ def test_audio_cudagraph(model_id, vllm_runner, audio_assets):
             assert len(output_ids) > 0
             assert len(output_text) > 0
             assert isinstance(output_text, str)
+
+        # The encoder cudagraph path must have actually replayed a captured graph --
+        # otherwise this test would still pass if every replay silently fell back to
+        # eager (the manager built but never hit), defeating the point of the test.
+        hits = vllm_model.collective_rpc(_encoder_cudagraph_graph_hits)
+        assert hits and hits[0] is not None and hits[0] > 0, (
+            f"audio encoder cudagraph never replayed (graph_hits={hits}); the "
+            "cudagraph_mm_encoder path fell back to eager"
+        )
