@@ -1466,12 +1466,14 @@ class Qwen2_5OmniConditionalGenerationMixin:
 
         return EncoderCudaGraphConfig(
             modalities=["audio"],
-            # input_buffer key: use the tiny per-clip lengths (the captured forward
-            # ignores it; this avoids a large unused input_features buffer).
-            input_key_by_modality={"audio": "audio_feature_lengths"},
-            # max_seqlen is NOT copied per replay: it is baked at capture as a CPU
-            # upper bound (flash reads it via host-side .item(), no D2H sync).
-            buffer_keys=["hidden_states", "cu_seqlens"],
+            # All graph I/O lives in one `values` dict (v0.23 unified mm_kwargs+buffers,
+            # input_key_by_modality removed). hidden_states is the layer-stack input;
+            # cu_seqlens is repeat-padded via padding_logics (a plain zero-pad would
+            # break monotonicity); max_seqlen is in the captured values but never copied
+            # at replay -> stays the CPU-baked upper bound (flash reads it host-side, no
+            # D2H sync during capture).
+            buffer_keys=["hidden_states", "cu_seqlens", "max_seqlen"],
+            padding_logics={"cu_seqlens": _pad_audio_cu_seqlens},
             out_hidden_size=self.audio_tower.config.output_dim,
             max_frames_per_video=1,
         )
@@ -1544,12 +1546,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
         # capture. The value is baked into the graph as a safe per-window upper bound.
         max_seqlen = torch.tensor(win, dtype=torch.int32)
         return EncoderCudaGraphCaptureInputs(
-            mm_kwargs={
-                "audio_feature_lengths": torch.zeros(
-                    max_batch_size, device=device, dtype=torch.long
-                )
-            },
-            buffers={
+            values={
                 "hidden_states": hidden_states,
                 "cu_seqlens": cu,
                 "max_seqlen": max_seqlen,
@@ -1568,21 +1565,22 @@ class Qwen2_5OmniConditionalGenerationMixin:
         hidden_states, cu_seqlens, _ = self.audio_tower._encode_prologue(
             input_features, feature_lens
         )
-        cu_seqlens = self._audio_cg_pad_cu_seqlens(cu_seqlens)
-        # max_seqlen is omitted: it is baked at capture (CPU upper bound), not copied.
+        # cu_seqlens is returned at its ACTUAL length; the manager repeat-pads it to
+        # the captured buffer size via padding_logics (_pad_audio_cu_seqlens).
+        # max_seqlen is omitted -> not copied -> stays the capture-baked CPU upper bound.
         return EncoderCudaGraphReplayBuffers(
-            buffers={
+            values={
                 "hidden_states": hidden_states,
                 "cu_seqlens": cu_seqlens,
             }
         )
 
-    def encoder_cudagraph_forward(self, mm_kwargs, buffers):
+    def encoder_cudagraph_forward(self, inputs):
         with set_forward_context(None, self.vllm_config):
             return self.audio_tower._run_encoder_layers(
-                buffers["hidden_states"],
-                buffers["cu_seqlens"],
-                buffers["max_seqlen"],
+                inputs["hidden_states"],
+                inputs["cu_seqlens"],
+                inputs["max_seqlen"],
             )
 
     def encoder_eager_forward(self, mm_kwargs):
@@ -1651,6 +1649,22 @@ class Qwen2_5OmniConditionalGenerationMixin:
         sizes = grid_thw.prod(-1) // merge_size // merge_size
 
         return video_embeds.split(sizes.tolist())
+
+
+def _pad_audio_cu_seqlens(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Repeat-pad an audio cu_seqlens buffer for encoder cudagraph replay.
+
+    Mirrors qwen2_5_vl._pad_cumulative_seqlens_buffer: copy the valid prefix then
+    fill the tail with the last boundary so the padded buffer stays monotonic (the
+    captured graph's trailing empty windows are no-ops). A plain zero-pad would
+    break cu_seqlens monotonicity, so this is registered in
+    EncoderCudaGraphConfig.padding_logics for the "cu_seqlens" key.
+    """
+    n = src.shape[0]
+    dst.zero_()
+    dst[:n].copy_(src)
+    if n < dst.shape[0]:
+        dst[n:] = src[-1]
 
 
 @MULTIMODAL_REGISTRY.register_processor(
