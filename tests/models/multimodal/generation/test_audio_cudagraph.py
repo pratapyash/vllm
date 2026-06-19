@@ -59,9 +59,9 @@ MODEL_CONFIGS: dict[str, AudioCudagraphTestConfig] = {
 def get_compilation_config(config: AudioCudagraphTestConfig):
     return {
         "cudagraph_mm_encoder": True,
-        # One audio clip per captured graph; multiple clips in a batch
-        # replay one graph each.
-        "encoder_cudagraph_max_vision_items_per_batch": 1,
+        # Up to 2 audio clips per captured graph: co-scheduled clips exercise the
+        # multi-item budget-packing path; otherwise each replays its own graph.
+        "encoder_cudagraph_max_vision_items_per_batch": 2,
         **config.compilation_config_overrides,
     }
 
@@ -86,8 +86,9 @@ def test_audio_cudagraph(model_id, vllm_runner, audio_assets):
     if config.skip:
         pytest.skip(f"{model_id} is marked to be skipped.")
 
-    # One prompt per audio asset (different durations) so the batch exercises
-    # the variable-length budget packing + per-clip replay.
+    # One prompt per audio asset (different durations) so replays exercise the
+    # variable-length cu_seqlens; with max_vision_items_per_batch=2, co-scheduled
+    # clips also exercise the multi-item budget-packing path.
     prompts = [config.audio_prompt for _ in audio_assets]
     audios = [[asset.audio_and_sample_rate] for asset in audio_assets]
 
