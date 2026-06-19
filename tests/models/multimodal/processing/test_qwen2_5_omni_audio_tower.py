@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 import torch.nn as nn
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
@@ -198,9 +199,20 @@ def test_audio_encoder_load_weights_remaps_hf_qkv_to_packed_qkv(
     torch.testing.assert_close(attention.qkv.bias[hidden_size * 2 :], v_bias)
 
 
+@pytest.mark.parametrize(
+    "backend, max_seqlen_set",
+    [
+        # flash-family backends derive a per-window max_seqlen; SDPA passes None
+        # (compute_attn_mask_seqlen returns None outside the flash set).
+        (qwen2_5_omni.AttentionBackendEnum.FLASH_ATTN, True),
+        (qwen2_5_omni.AttentionBackendEnum.TORCH_SDPA, False),
+    ],
+)
 def test_audio_encoder_forward_uses_mm_encoder_attention(
     monkeypatch,
     default_vllm_config,
+    backend,
+    max_seqlen_set,
 ):
     monkeypatch.setattr(
         qwen2_5_omni,
@@ -211,7 +223,7 @@ def test_audio_encoder_forward_uses_mm_encoder_attention(
     monkeypatch.setattr(
         qwen2_5_omni,
         "get_vit_attn_backend",
-        lambda **_: qwen2_5_omni.AttentionBackendEnum.FLASH_ATTN,
+        lambda **_: backend,
     )
 
     config = tiny_audio_config()
@@ -240,4 +252,7 @@ def test_audio_encoder_forward_uses_mm_encoder_attention(
         call["cu_seqlens"],
         torch.tensor([0, aftercnn_lens.item()], dtype=torch.int32),
     )
-    assert call["max_seqlen"].item() == aftercnn_lens.item()
+    if max_seqlen_set:
+        assert call["max_seqlen"].item() == aftercnn_lens.item()
+    else:
+        assert call["max_seqlen"] is None
