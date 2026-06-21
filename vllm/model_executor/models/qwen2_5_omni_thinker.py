@@ -266,9 +266,7 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         super().__init__()
         self.embed_dim = config.d_model
         self.num_heads = config.encoder_attention_heads
-        self.dropout = config.attention_dropout
         self.head_dim = self.embed_dim // self.num_heads
-        self.config = config
         tp_size = get_tensor_model_parallel_world_size()
         self.num_local_heads = self.num_heads // tp_size
 
@@ -279,8 +277,6 @@ class Qwen2_5OmniAudioAttention(nn.Module):
             )
 
         self.scaling = self.head_dim**-0.5
-        self.is_decoder = False
-        self.is_causal = False
 
         self.qkv = QKVParallelLinear(
             hidden_size=self.embed_dim,
@@ -394,7 +390,7 @@ class Qwen2_5OmniAudioEncoderLayer(nn.Module):
                 max=clamp_value,
             )
 
-        return (hidden_states,)
+        return hidden_states
 
 
 class Qwen2_5OmniAudioEncoder(nn.Module):
@@ -532,7 +528,7 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
         padded_embed = F.gelu(self.conv1(padded_feature)) * padded_mask
         padded_embed = F.gelu(self.conv2(padded_embed)).transpose(1, 2)
         positional_embedding = (
-            self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
+            self.positional_embedding(padded_embed.shape[1])
             .unsqueeze(0)
             .to(padded_embed.dtype)
         )
@@ -562,12 +558,11 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
         region. Inputs are the packed hidden_states plus precomputed varlen
         metadata; no data-dependent shapes or host-syncs here."""
         for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(
+            hidden_states = encoder_layer(
                 hidden_states,
                 cu_seqlens,
                 max_seqlen,
             )
-            hidden_states = layer_outputs[0]
         return hidden_states
 
     def _encode_epilogue(
@@ -1450,6 +1445,8 @@ class Qwen2_5OmniConditionalGenerationMixin:
 
     def _audio_cg_post_cnn_window(self) -> int:
         # pre-CNN chunk = n_window*2 frames; conv2 stride-2 -> post-CNN window tokens.
+        # This evaluates to n_window exactly, but is kept conv-derived so it tracks the
+        # CNN stem geometry if conv2 ever changes.
         n = self.audio_tower.n_window * 2
         return (n - 1) // 2 + 1
 
@@ -1505,7 +1502,7 @@ class Qwen2_5OmniConditionalGenerationMixin:
         min_budget = 16
         max_budget = min(
             vllm_config.scheduler_config.max_num_batched_tokens,
-            self.vllm_config.model_config.max_model_len,
+            vllm_config.model_config.max_model_len,
         )
         return (min_budget, max(max_budget, min_budget))
 
