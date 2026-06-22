@@ -80,11 +80,17 @@ def _encoder_cudagraph_graph_hits(worker):
 
 @pytest.mark.parametrize("model_id", params_with_marks(MODEL_CONFIGS))
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
-def test_audio_cudagraph(model_id, vllm_runner, audio_assets):
+def test_audio_cudagraph(model_id, vllm_runner, audio_assets, monkeypatch):
     config = MODEL_CONFIGS[model_id]
 
     if config.skip:
         pytest.skip(f"{model_id} is marked to be skipped.")
+
+    # Run the engine in-process so the graph_hits probe below can be passed to
+    # collective_rpc as a plain callable: vLLM's msgpack worker RPC cannot
+    # serialize a function across the multiprocessing boundary, so an out-of-proc
+    # worker would raise "Object of type function is not serializable".
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
     # One prompt per audio asset (different durations) so replays exercise the
     # variable-length cu_seqlens; with max_vision_items_per_batch=2, co-scheduled
