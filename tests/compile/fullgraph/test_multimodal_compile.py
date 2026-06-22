@@ -74,6 +74,72 @@ def test_qwen2_5_vl_no_vit_compilation(vllm_runner, monkeypatch):
 
 
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
+@pytest.mark.forked
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+def test_qwen2_5_omni_audio_compilation(vllm_runner, monkeypatch):
+    """Test that the Qwen2.5-Omni audio encoder layers are marked for compilation.
+
+    The audio tower has 32 Qwen2_5OmniAudioEncoderLayer blocks, each decorated
+    with @support_torch_compile(enable_if=should_torch_compile_mm_encoder).
+
+    With compile_mm_encoder=True, num_models_seen rises from 1 (LLM backbone only)
+    to 67. This count is the LLM (1) plus BOTH multimodal encoders, since
+    Qwen2.5-Omni reuses the already-compile-decorated Qwen2_5_VisionTransformer:
+    34 vision-tower submodules (same 34 the Qwen2.5-VL test counts) + the 32 audio
+    encoder layers added here. The audio contribution is the +32 over stock
+    Qwen2.5-Omni's 35. As with Qwen2.5-VL (issue #27590) each layer is counted
+    separately today.
+
+    NOTE: num_models_seen only proves the layers are MARKED for compile (the
+    vision tower is marked here but never executes under image=0, so it produces
+    no graphs). That the audio encoder is actually compiled -- not a silent no-op
+    -- is shown by the end-to-end script in validation/phase_a (num_graphs_seen
+    1->33 and a fresh Inductor compile over the is_encoder (1, 2147483647) range).
+    """
+    # Disable multiprocessing so that the counter is in the same process
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    with (
+        compilation_counter.expect(num_models_seen=67),
+        vllm_runner(
+            "Qwen/Qwen2.5-Omni-3B",
+            max_model_len=4096,
+            gpu_memory_utilization=0.85,
+            limit_mm_per_prompt={"audio": 1, "image": 0, "video": 0},
+            compilation_config={
+                "mode": CompilationMode.VLLM_COMPILE,
+                "compile_mm_encoder": True,
+            },
+        ) as _,
+    ):
+        pass
+
+
+# forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
+@pytest.mark.forked
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+def test_qwen2_5_omni_audio_no_compilation(vllm_runner, monkeypatch):
+    """Audio encoder is NOT compiled when compile_mm_encoder=False (LLM only)."""
+    # Disable multiprocessing so that the counter is in the same process
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    with (
+        compilation_counter.expect(num_models_seen=1),
+        vllm_runner(
+            "Qwen/Qwen2.5-Omni-3B",
+            max_model_len=4096,
+            gpu_memory_utilization=0.85,
+            limit_mm_per_prompt={"audio": 1, "image": 0, "video": 0},
+            compilation_config={
+                "mode": CompilationMode.VLLM_COMPILE,
+                "compile_mm_encoder": False,
+            },
+        ) as _,
+    ):
+        pass
+
+
+# forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
 # Requires Cuda and 8 gpus as well
 @pytest.mark.forked
 @pytest.mark.skip(reason="Skipping due to CI resource constraints")
