@@ -174,6 +174,19 @@ VLM_TEST_SETTINGS = {
         image_size_factors=[(0.25,), (0.25, 0.25, 0.25), (0.25, 0.2, 0.15)],
         marks=[pytest.mark.core_model, pytest.mark.cpu_model],
     ),
+    "qwen2_5_omni_audio": VLMTestInfo(
+        models=["Qwen/Qwen2.5-Omni-3B"],
+        test_type=VLMTestType.AUDIO,
+        prompt_formatter=lambda audio_prompt: f"<|im_start|>User\n{audio_prompt}<|im_end|>\n<|im_start|>assistant\n",  # noqa: E501
+        audio_idx_to_prompt=lambda idx: "<|audio_bos|><|AUDIO|><|audio_eos|>",
+        max_model_len=4096,
+        max_num_seqs=2,
+        num_logprobs=6 if current_platform.is_cpu() else 5,
+        auto_cls=AutoModelForTextToWaveform,
+        vllm_output_post_proc=model_utils.qwen2_vllm_to_hf_output,
+        patch_hf_runner=model_utils.qwen2_5_omni_patch_hf_runner,
+        marks=[pytest.mark.core_model],
+    ),
     "qwen3_vl": VLMTestInfo(
         models=["Qwen/Qwen3-VL-4B-Instruct"],
         test_type=(

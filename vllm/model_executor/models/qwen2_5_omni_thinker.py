@@ -54,7 +54,6 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
 )
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VisionTransformer,
@@ -261,9 +260,7 @@ class Qwen2_5OmniAudioAttention(nn.Module):
         super().__init__()
         self.embed_dim = config.d_model
         self.num_heads = config.encoder_attention_heads
-        self.dropout = config.attention_dropout
         self.head_dim = self.embed_dim // self.num_heads
-        self.config = config
         tp_size = get_tensor_model_parallel_world_size()
         self.num_local_heads = self.num_heads // tp_size
 
@@ -274,8 +271,6 @@ class Qwen2_5OmniAudioAttention(nn.Module):
             )
 
         self.scaling = self.head_dim**-0.5
-        self.is_decoder = False
-        self.is_causal = False
 
         self.qkv = QKVParallelLinear(
             hidden_size=self.embed_dim,
@@ -285,6 +280,13 @@ class Qwen2_5OmniAudioAttention(nn.Module):
             bias=True,
             prefix=f"{prefix}.qkv",
         )
+        # HF Qwen2.5-Omni audio has bias=False for k_proj, while the packed
+        # QKV bias allocates a slot for each of q/k/v. Zero the packed bias at
+        # construction so the never-loaded K slot matches HF (zero) instead of
+        # uninitialized memory; the q/v slots are overwritten at weight load.
+        if self.qkv.bias is not None:
+            with torch.no_grad():
+                self.qkv.bias.zero_()
         self.out_proj = RowParallelLinear(
             input_size=self.embed_dim,
             output_size=self.embed_dim,
@@ -352,7 +354,7 @@ class Qwen2_5OmniAudioEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
-    ) -> tuple[torch.Tensor]:
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
         hidden_states = self.self_attn(
@@ -377,11 +379,19 @@ class Qwen2_5OmniAudioEncoderLayer(nn.Module):
                 max=clamp_value,
             )
 
-        return (hidden_states,)
+        return hidden_states
 
 
 class Qwen2_5OmniAudioEncoder(nn.Module):
     """vLLM-native Qwen2.5-Omni audio encoder."""
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            ".self_attn.q_proj.": (".self_attn.qkv.", "q"),
+            ".self_attn.k_proj.": (".self_attn.qkv.", "k"),
+            ".self_attn.v_proj.": (".self_attn.qkv.", "v"),
+        }
+    )
 
     def __init__(
         self,
@@ -428,6 +438,12 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
             head_size=config.d_model // config.encoder_attention_heads,
             dtype=torch.get_default_dtype(),
         )
+        if self.attn_backend == AttentionBackendEnum.FLASHINFER:
+            raise RuntimeError(
+                "The Qwen2.5-Omni audio encoder does not support the "
+                "FLASHINFER attention backend; use FLASH_ATTN or TORCH_SDPA "
+                "(e.g. set mm_encoder_attn_backend accordingly)."
+            )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -486,7 +502,7 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
         padded_embed = F.gelu(self.conv1(padded_feature)) * padded_mask
         padded_embed = F.gelu(self.conv2(padded_embed)).transpose(1, 2)
         positional_embedding = (
-            self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
+            self.positional_embedding(padded_embed.shape[1])
             .unsqueeze(0)
             .to(padded_embed.dtype)
         )
@@ -506,12 +522,11 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
 
         for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(
+            hidden_states = encoder_layer(
                 hidden_states,
                 cu_seqlens,
                 max_seqlen,
             )
-            hidden_states = layer_outputs[0]
 
         hidden_states_list = hidden_states.split(aftercnn_lens.tolist(), dim=0)
         token_audio_list = []
@@ -527,44 +542,15 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
         return token_audio
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load audio tower weights with HF q/k/v projections packed for vLLM."""
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("self_attn.qkv.", "self_attn.q_proj.", "q"),
-            ("self_attn.qkv.", "self_attn.k_proj.", "k"),
-            ("self_attn.qkv.", "self_attn.v_proj.", "v"),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        with torch.no_grad():
-            for name, param in params_dict.items():
-                if name.endswith("self_attn.qkv.bias"):
-                    # HF Qwen2.5-Omni audio has bias=False for k_proj, while
-                    # vLLM's packed QKV bias has a slot for q/k/v. Keep the
-                    # missing K bias equivalent to HF by zeroing before load.
-                    param.zero_()
+        """Load audio tower weights with HF q/k/v projections packed for vLLM.
 
-        loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict.get(name)
-                if param is not None:
-                    weight_loader = getattr(
-                        param,
-                        "weight_loader",
-                        default_weight_loader,
-                    )
-                    weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        The missing K bias (HF k_proj has bias=False) is handled at
+        construction time by zeroing the packed QKV bias in
+        Qwen2_5OmniAudioAttention, so plain AutoWeightsLoader delegation is
+        sufficient here (mirrors Qwen3OmniMoeAudioEncoder).
+        """
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def padded_and_mask_function(
         self,
