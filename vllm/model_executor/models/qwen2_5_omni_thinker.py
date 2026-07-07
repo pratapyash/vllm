@@ -54,6 +54,7 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import (
     MMEncoderAttention,
 )
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VisionTransformer,
@@ -385,14 +386,6 @@ class Qwen2_5OmniAudioEncoderLayer(nn.Module):
 class Qwen2_5OmniAudioEncoder(nn.Module):
     """vLLM-native Qwen2.5-Omni audio encoder."""
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_stacked={
-            ".self_attn.q_proj.": (".self_attn.qkv.", "q"),
-            ".self_attn.k_proj.": (".self_attn.qkv.", "k"),
-            ".self_attn.v_proj.": (".self_attn.qkv.", "v"),
-        }
-    )
-
     def __init__(
         self,
         config: Qwen2_5OmniAudioEncoderConfig,
@@ -542,15 +535,49 @@ class Qwen2_5OmniAudioEncoder(nn.Module):
         return token_audio
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load audio tower weights with HF q/k/v projections packed for vLLM.
+        """Load audio tower weights with HF q/k/v projections packed for vLLM."""
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("self_attn.qkv.", "self_attn.q_proj.", "q"),
+            ("self_attn.qkv.", "self_attn.k_proj.", "k"),
+            ("self_attn.qkv.", "self_attn.v_proj.", "v"),
+        ]
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        with torch.no_grad():
+            for name, param in params_dict.items():
+                if name.endswith("self_attn.qkv.bias"):
+                    # HF Qwen2.5-Omni audio has bias=False for k_proj, while
+                    # vLLM's packed QKV bias has a slot for q/k/v. Keep the
+                    # missing K bias equivalent to HF by zeroing before load.
+                    param.zero_()
 
-        The missing K bias (HF k_proj has bias=False) is handled at
-        construction time by zeroing the packed QKV bias in
-        Qwen2_5OmniAudioAttention, so plain AutoWeightsLoader delegation is
-        sufficient here (mirrors Qwen3OmniMoeAudioEncoder).
-        """
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                break
+            else:
+                # .get (not []) so non-parameter keys (e.g. a computed
+                # positional-embedding buffer) are skipped, not errored. Record
+                # only weights actually loaded, so loaded_params never over-counts.
+                param = params_dict.get(name)
+                if param is None:
+                    continue
+                weight_loader = getattr(
+                    param,
+                    "weight_loader",
+                    default_weight_loader,
+                )
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+        return loaded_params
 
     def padded_and_mask_function(
         self,
