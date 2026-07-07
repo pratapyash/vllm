@@ -2010,6 +2010,12 @@ class VllmConfig:
         if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
             unsupported.append("stock torch.compile")
 
+        if self.compilation_config.cudagraph_mm_encoder:
+            # EncoderCudaGraphManager is only wired into the V1 GPU model
+            # runner; V2 executes multimodal encoders eagerly and would
+            # silently ignore this flag.
+            unsupported.append("encoder CUDA graphs (cudagraph_mm_encoder)")
+
         if (
             self.compilation_config.pass_config.enable_sp
             and self.parallel_config.tensor_parallel_size > 1
