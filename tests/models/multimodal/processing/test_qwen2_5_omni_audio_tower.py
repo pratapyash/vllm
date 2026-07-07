@@ -159,6 +159,14 @@ def test_audio_encoder_load_weights_remaps_hf_qkv_to_packed_qkv(
     attention = encoder.layers[0].self_attn
     hidden_size = config.d_model
 
+    # The packed QKV bias must be zeroed at construction: the HF checkpoint
+    # has bias=False for k_proj, so the K slot is never written during load
+    # and relies on the init-time zero (not uninitialized memory).
+    torch.testing.assert_close(
+        attention.qkv.bias[hidden_size : hidden_size * 2],
+        torch.zeros(hidden_size),
+    )
+
     q_weight = torch.arange(hidden_size * hidden_size, dtype=torch.float32).view(
         hidden_size, hidden_size
     )
@@ -166,9 +174,6 @@ def test_audio_encoder_load_weights_remaps_hf_qkv_to_packed_qkv(
     v_weight = q_weight + 200
     q_bias = torch.arange(hidden_size, dtype=torch.float32)
     v_bias = q_bias + 20
-
-    with torch.no_grad():
-        attention.qkv.bias.fill_(123)
 
     loaded = encoder.load_weights(
         [
@@ -189,6 +194,8 @@ def test_audio_encoder_load_weights_remaps_hf_qkv_to_packed_qkv(
     )
     torch.testing.assert_close(attention.qkv.weight[hidden_size * 2 :], v_weight)
     torch.testing.assert_close(attention.qkv.bias[:hidden_size], q_bias)
+    # The K slot must survive the load untouched (still the init-time zero):
+    # the loader must never write it, since HF provides no k_proj bias.
     torch.testing.assert_close(
         attention.qkv.bias[hidden_size : hidden_size * 2],
         torch.zeros_like(q_bias),
