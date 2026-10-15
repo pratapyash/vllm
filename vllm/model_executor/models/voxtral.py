@@ -22,6 +22,7 @@ from vllm.config.multimodal import BaseDummyOptions
 from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.inputs import MultiModalDataDict, PromptType, TokensPrompt
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models import SupportsPP
@@ -347,6 +348,7 @@ class VoxtralForConditionalGeneration(
             self.audio_language_adapter = AudioLanguageAdapter(
                 hidden_size=config.audio_config.d_model * self.downsample_factor,
                 dim=config.text_config.hidden_size,
+                prefix=maybe_prefix(prefix, "audio_language_adapter"),
             )
 
         self.make_empty_intermediate_tensors = (
@@ -360,6 +362,15 @@ class VoxtralForConditionalGeneration(
             connector="audio_language_adapter",
             tower_model=["whisper_encoder"],
         )
+
+    def get_num_mm_encoder_tokens(self, num_audio_tokens: int) -> int:
+        # The encoder always runs on whole 30 s chunks.
+        chunk = self.config.audio_config.max_source_positions
+        per_chunk = chunk // self.downsample_factor
+        return -(-num_audio_tokens // per_chunk) * chunk
+
+    def get_num_mm_connector_tokens(self, num_encoder_tokens: int) -> int:
+        return num_encoder_tokens // self.downsample_factor
 
     def forward(
         self,
@@ -657,14 +668,18 @@ class VoxtralForConditionalGeneration(
 
 
 class AudioLanguageAdapter(nn.Module):
-    def __init__(self, hidden_size: int, dim: int) -> None:
+    def __init__(self, hidden_size: int, dim: int, prefix: str = "") -> None:
         super().__init__()
-        self.w_in = nn.Linear(hidden_size, dim, bias=False)
+        self.w_in = ReplicatedLinear(
+            hidden_size, dim, bias=False, prefix=f"{prefix}.w_in"
+        )
         self.gelu = nn.GELU()
-        self.w_out = nn.Linear(dim, dim, bias=False)
+        self.w_out = ReplicatedLinear(dim, dim, bias=False, prefix=f"{prefix}.w_out")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w_out(self.gelu(self.w_in(x)))
+        x, _ = self.w_in(x)
+        x, _ = self.w_out(self.gelu(x))
+        return x
 
 
 class VoxtralEncoderModel(nn.Module):
